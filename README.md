@@ -126,6 +126,15 @@ fully-mocked stack. Copy `.env.example` → `.env` to override.
 
 ### Using a real LLM (Ollama)
 
+> **Caveat:** the assignment permits mocked NLP/LLM, and the **mock classifier is
+> the default and the tested path** (it's what the demo and integration tests
+> exercise). The Ollama integration is included as a **reference implementation**
+> of a real-LLM path — the `Classifier` interface, prompt, structured-output
+> schema, retry/back-off and rate-limit handling, and config wiring — but it has
+> **not been run against a live Ollama endpoint**. It's wired and unit-tested
+> (see [internal/llm/ollama_test.go](internal/llm/ollama_test.go)), not validated
+> end-to-end.
+
 Set these (e.g. in `.env`) and restart — classification then calls a real model
 through the same `Classifier` interface, with structured JSON output, retries,
 and rate-limit handling:
