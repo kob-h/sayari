@@ -11,6 +11,7 @@ import (
 	"strconv"
 
 	"github.com/kob-h/docpipeline/internal/queue"
+	"github.com/kob-h/docpipeline/internal/store"
 )
 
 // ExtractJob is the message that asks a worker to extract a document.
@@ -26,25 +27,25 @@ type ClassifyJob struct {
 	RunVersion int    `json:"run_version"`
 }
 
-// PublishExtract enqueues an extraction job.
-func PublishExtract(ctx context.Context, b queue.Broker, job ExtractJob) error {
+// EnqueueExtract writes an extraction job to the transactional outbox using the
+// caller's transaction, so it commits atomically with the state change that
+// produced it. The relay publishes it to the broker.
+func EnqueueExtract(ctx context.Context, tx *store.Tx, job ExtractJob) error {
 	payload, err := json.Marshal(job)
 	if err != nil {
 		return fmt.Errorf("marshal extract job: %w", err)
 	}
-	return b.Publish(ctx, queue.StreamExtract, queue.Message{Key: job.DocumentID, Payload: payload})
+	return tx.EnqueueOutbox(ctx, queue.StreamExtract, job.DocumentID, payload)
 }
 
-// PublishClassify enqueues a classification job.
-func PublishClassify(ctx context.Context, b queue.Broker, job ClassifyJob) error {
+// EnqueueClassify writes a classification job to the transactional outbox using
+// the caller's transaction.
+func EnqueueClassify(ctx context.Context, tx *store.Tx, job ClassifyJob) error {
 	payload, err := json.Marshal(job)
 	if err != nil {
 		return fmt.Errorf("marshal classify job: %w", err)
 	}
-	return b.Publish(ctx, queue.StreamClassify, queue.Message{
-		Key:     strconv.FormatInt(job.TokenID, 10),
-		Payload: payload,
-	})
+	return tx.EnqueueOutbox(ctx, queue.StreamClassify, strconv.FormatInt(job.TokenID, 10), payload)
 }
 
 func decode[T any](payload []byte) (T, error) {

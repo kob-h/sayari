@@ -1,6 +1,7 @@
-// Command api serves the HTTP API and runs the reconciler control loop. It only
-// accepts documents and publishes the first job; all processing happens in the
-// worker services, so the API scales independently of throughput.
+// Command api serves the HTTP API and runs the outbox relay. It only accepts
+// documents (writing the doc and its first job to the outbox in one transaction);
+// all processing happens in the worker services, so the API scales independently
+// of throughput.
 package main
 
 import (
@@ -13,7 +14,8 @@ import (
 	"github.com/kob-h/docpipeline/internal/api"
 	"github.com/kob-h/docpipeline/internal/app"
 	"github.com/kob-h/docpipeline/internal/config"
-	"github.com/kob-h/docpipeline/internal/reconciler"
+	"github.com/kob-h/docpipeline/internal/outbox"
+	"github.com/kob-h/docpipeline/internal/service"
 )
 
 func main() {
@@ -41,15 +43,17 @@ func main() {
 	}
 	defer func() { _ = broker.Close() }()
 
-	// The reconciler runs in the API (control-plane) process. At higher API
-	// replica counts it would move to its own deployment; re-enqueues are
-	// idempotent so duplicate passes are harmless.
-	rec := reconciler.New(st, broker, cfg.ReconcileInterval, log)
-	go func() { _ = rec.Run(ctx) }()
+	// The outbox relay runs in the API (control-plane) process: it publishes
+	// messages that producers wrote transactionally with their state changes. At
+	// higher replica counts it can move to its own deployment; FOR UPDATE SKIP
+	// LOCKED lets multiple relays share the outbox safely.
+	relay := outbox.New(st, broker, cfg.OutboxPollInterval, log)
+	go func() { _ = relay.Run(ctx) }()
 
+	svc := service.NewDocumentService(st, broker, log)
 	srv := &http.Server{
 		Addr:              cfg.HTTPAddr,
-		Handler:           api.NewServer(st, broker, log).Handler(),
+		Handler:           api.NewServer(svc, log).Handler(),
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 

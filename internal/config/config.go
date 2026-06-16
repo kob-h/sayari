@@ -39,8 +39,8 @@ type Config struct {
 	// ClaimMinIdle is how long a pending (un-acked) message must be idle before
 	// another consumer may reclaim it via XAUTOCLAIM.
 	ClaimMinIdle time.Duration
-	// ReconcileInterval is how often the reconciler re-enqueues orphaned work.
-	ReconcileInterval time.Duration
+	// OutboxPollInterval is how often the relay drains the transactional outbox.
+	OutboxPollInterval time.Duration
 	// ShutdownTimeout bounds graceful shutdown.
 	ShutdownTimeout time.Duration
 }
@@ -49,19 +49,19 @@ type Config struct {
 // defaults so the stack runs with zero required env vars (mock LLM).
 func Load() (Config, error) {
 	c := Config{
-		PostgresDSN:       env("POSTGRES_DSN", "postgres://docpipe:docpipe@localhost:5432/docpipe?sslmode=disable"),
-		RedisAddr:         env("REDIS_ADDR", "localhost:6379"),
-		RedisPassword:     env("REDIS_PASSWORD", ""),
-		HTTPAddr:          env("HTTP_ADDR", ":8080"),
-		LLMProvider:       env("LLM_PROVIDER", "mock"),
-		MockClassifyDelay: envDuration("MOCK_CLASSIFY_DELAY", 0),
-		OllamaBaseURL:     env("OLLAMA_BASE_URL", "https://ollama.com"),
-		OllamaAPIKey:      env("OLLAMA_API_KEY", ""),
-		OllamaModel:       env("OLLAMA_MODEL", "gpt-oss:20b"),
-		WorkerConcurrency: envInt("WORKER_CONCURRENCY", 8),
-		ClaimMinIdle:      envDuration("CLAIM_MIN_IDLE", 30*time.Second),
-		ReconcileInterval: envDuration("RECONCILE_INTERVAL", 15*time.Second),
-		ShutdownTimeout:   envDuration("SHUTDOWN_TIMEOUT", 20*time.Second),
+		PostgresDSN:        env("POSTGRES_DSN", "postgres://docpipe:docpipe@localhost:5432/docpipe?sslmode=disable"),
+		RedisAddr:          env("REDIS_ADDR", "localhost:6379"),
+		RedisPassword:      env("REDIS_PASSWORD", ""),
+		HTTPAddr:           env("HTTP_ADDR", ":8080"),
+		LLMProvider:        env("LLM_PROVIDER", "mock"),
+		MockClassifyDelay:  envDuration("MOCK_CLASSIFY_DELAY", 0),
+		OllamaBaseURL:      env("OLLAMA_BASE_URL", "https://ollama.com"),
+		OllamaAPIKey:       env("OLLAMA_API_KEY", ""),
+		OllamaModel:        env("OLLAMA_MODEL", "gpt-oss:20b"),
+		WorkerConcurrency:  envInt("WORKER_CONCURRENCY", 8),
+		ClaimMinIdle:       envDuration("CLAIM_MIN_IDLE", 30*time.Second),
+		OutboxPollInterval: envDuration("OUTBOX_POLL_INTERVAL", time.Second),
+		ShutdownTimeout:    envDuration("SHUTDOWN_TIMEOUT", 20*time.Second),
 	}
 	if c.LLMProvider == "ollama" && c.OllamaAPIKey == "" {
 		// Hosted Ollama requires a key; fail fast rather than 401 on every token.
