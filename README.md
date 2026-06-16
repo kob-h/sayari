@@ -11,11 +11,36 @@ Document ──► Extraction (NLP) ──► tokens ──► Classification (L
               cmd/extractor                    cmd/classifier
                      │   Redis Streams (extract / classify)   │
                      └──────────────► PostgreSQL ◄────────────┘  (source of truth)
-                                       cmd/api  (HTTP + reconciler)
+                                       cmd/api  (HTTP + outbox relay)
 ```
 
 > **Example:** `"John Smith works at Acme Corp, located at 123 Main St."` →
 > `John Smith → PERSON`, `Acme Corp → COMPANY`, `123 Main St → ADDRESS`.
+
+## Deliverables map
+
+Where each deliverable from the assignment lives in this repo:
+
+| Deliverable (assignment) | Where to find it |
+|---|---|
+| **Technology selection** (table + justification) | [docs/tech-selection.md](docs/tech-selection.md) |
+| **Architecture design document** | [docs/architecture.md](docs/architecture.md) — plus [rerun & recovery](docs/rerun-and-recovery.md), [duration tracking](docs/duration-tracking.md) |
+| **Data model schemas** (typed defs / schema) | [docs/data-model.md](docs/data-model.md); typed structs in [internal/domain/domain.go](internal/domain/domain.go); SQL in [internal/store/migrations/](internal/store/migrations/) |
+| **Architecture diagram** (Mermaid) | [docs/architecture.md §2](docs/architecture.md#2-high-level-architecture) |
+| **Communication contracts / API interfaces** | [docs/architecture.md §3](docs/architecture.md#3-communication-contracts); code: [internal/api/](internal/api/), [internal/pipeline/jobs.go](internal/pipeline/jobs.go), [internal/nlp/nlp.go](internal/nlp/nlp.go), [internal/llm/llm.go](internal/llm/llm.go) |
+| **Trade-off analysis** | [docs/trade-offs.md](docs/trade-offs.md); [ADRs](docs/adr/); [failure scenarios](docs/failure-scenarios.md) |
+| **Working POC** (git repository) | this repo — run via [Quick start](#quick-start) |
+| **Setup instructions** | this README → [Quick start](#quick-start) |
+| **Test documents** (≥ 3) | [testdata/docs/](testdata/docs/) — small / medium / large |
+| **Integration tests** (core scenarios) | [test/](test/) — run with `make test` |
+| **Demo script** (all scenarios) | [scripts/demo.sh](scripts/demo.sh) — run with `make demo` |
+| **AI proficiency** (committed prompts) | [prompts/](prompts/) |
+
+The four cross-cutting requirements map to: independent scaling →
+[architecture.md §2](docs/architecture.md#2-high-level-architecture); reruns →
+[rerun-and-recovery.md](docs/rerun-and-recovery.md); duration tracking →
+[duration-tracking.md](docs/duration-tracking.md); local development → the
+[Quick start](#quick-start) below.
 
 ## Quick start
 
@@ -25,6 +50,15 @@ Prerequisites: **Docker** (with Compose) and, for development, **Go 1.22+**.
 ./start.sh            # builds and starts Postgres, Redis, api, extractor, classifier
 # …then, in another shell:
 ./scripts/demo.sh     # runs all six scenarios end-to-end
+```
+
+Or the same via Make:
+
+```bash
+make up      # build + start the stack (= docker compose up --build -d)
+make demo    # run all six scenarios (= ./scripts/demo.sh)
+make logs    # (optional) tail logs from all services
+make down    # stop everything and remove volumes
 ```
 
 `start.sh` waits until the API is healthy and prints example commands. No API keys
@@ -47,7 +81,7 @@ curl "http://localhost:8080/documents/doc-123/tokens?classification=PERSON"
 
 `POST /process` accepts an optional `"mode"`: `"partial"` (default — resume) or
 `"full"` (reprocess from scratch). Token queries accept
-`classification`, `type`, `status`, `page`, `limit`, `offset`.
+`classification`, `status`, `page`, `limit`, `offset`.
 
 ## The six demo scenarios
 
@@ -60,7 +94,7 @@ curl "http://localhost:8080/documents/doc-123/tokens?classification=PERSON"
 | 3 | **Partial rerun** | Kill the classifier mid-run, restart, resume from the checkpoint |
 | 4 | **Full rerun** | Reprocess with `mode=full`; `run_version` bumps, data replaced |
 | 5 | Concurrent documents | Three documents processed at once |
-| 6 | Query | Filter tokens by classification / type / page |
+| 6 | Query | Filter tokens by classification / status / page |
 
 ## Running tests
 
@@ -88,7 +122,7 @@ fully-mocked stack. Copy `.env.example` → `.env` to override.
 | `LLM_PROVIDER` | `mock` | `mock` or `ollama` |
 | `MOCK_CLASSIFY_DELAY` | `0` (compose: `120ms`) | Simulated per-token latency, to make progress visible |
 | `OLLAMA_BASE_URL` / `OLLAMA_API_KEY` / `OLLAMA_MODEL` | `https://ollama.com` / – / `gpt-oss:20b` | Real classifier (see below) |
-| `RECONCILE_INTERVAL` / `CLAIM_MIN_IDLE` | `15s` / `30s` | Recovery timing |
+| `OUTBOX_POLL_INTERVAL` / `CLAIM_MIN_IDLE` | `1s` / `30s` | Relay cadence / PEL reclaim timing |
 
 ### Using a real LLM (Ollama)
 
@@ -110,13 +144,14 @@ cmd/{api,extractor,classifier}   three service binaries (independent scaling)
 internal/
   domain/      core types & contracts (Document, Token, states)
   config/      env-based configuration
-  store/       PostgreSQL persistence + migrations (source of truth)
+  store/       PostgreSQL persistence + migrations + Unit-of-Work + outbox (repository layer)
   queue/       Broker interface + Redis Streams implementation
-  reconciler/  re-enqueues orphaned work (consistency backstop)
+  outbox/      relay that publishes the transactional outbox to the broker
   nlp/         Extractor interface + rule-based mock
   llm/         Classifier interface + mock + Ollama
-  pipeline/    worker loops & job contracts
-  api/         HTTP handlers
+  pipeline/    stage workers (service layer) + job contracts
+  service/     application service for the API path (submit orchestration)
+  api/         thin HTTP handlers + DTOs
 test/          integration tests (testcontainers)
 testdata/docs/ small / medium / large sample documents
 docs/          architecture, ADRs, data model, trade-offs, failure analysis

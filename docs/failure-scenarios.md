@@ -11,29 +11,29 @@ Two sub-cases, both safe:
 
 - **Crash before the Postgres commit.** Nothing was written. The token stays
   `PENDING` and the `classify` message was never `XACK`ed, so it remains in the
-  consumer's PEL. A restarted/other classifier reclaims it via `XAUTOCLAIM` (or the
-  reconciler re-enqueues it) and classifies it. No loss.
+  consumer's PEL. A restarted/other classifier reclaims it via `XAUTOCLAIM` and
+  classifies it. No loss.
 - **Crash after the commit, before `XACK`.** The result is durably persisted. The
-  message is redelivered, but `ApplyClassification` sees the token is already
-  `CLASSIFIED` and no-ops — crucially, **without** double-incrementing
+  message is redelivered, but the classification worker's `apply` sees the token is
+  already `CLASSIFIED` and no-ops — crucially, **without** double-incrementing
   `classified_count`. No double count.
 
-This is exactly what `TestStore_ClassificationIsIdempotent` and the
+This is exactly what `TestPipeline_ClassificationIdempotentAndCompletes` and the
 `TestIntegration_PartialRerun` test assert.
 
 ## 2. Extraction crashes mid-way (some tokens written, others not)
 
-- Token writes are idempotent upserts on the natural key, so the partial set is
-  consistent (no duplicates on retry).
-- The document is still `EXTRACTING` (the transition to `CLASSIFYING` only happens
-  in the *final* `SaveExtraction` transaction, which also sets `total_tokens` from
-  the actual row count). So a half-finished extraction never looks complete.
-- The `extract` message was not `XACK`ed → it is redelivered, and re-extraction
-  converges to the full token set, then advances to `CLASSIFYING`.
-- If extraction *committed* its tokens but crashed before enqueuing every
-  `classify` job, the **reconciler** finds the `PENDING` tokens under the
-  `CLASSIFYING` document and enqueues them. (`TestStore_FindOrphans` covers the
-  detection.)
+- Extraction's persist runs in **one transaction**: it upserts the tokens
+  (idempotently, on the natural key), advances the document to `CLASSIFYING` with
+  `total_tokens` set from the actual row count, **and** writes the `classify`
+  outbox rows. Either all of that commits or none of it does.
+- So there is no "tokens written but no classify messages" state: the tokens and
+  their messages are in the same commit. A crash before commit leaves the document
+  `EXTRACTING` and the un-`XACK`ed `extract` message redelivers; re-extraction
+  converges to the same rows and commits once.
+- After commit, the relay publishes the classify outbox rows. A crash before
+  `XACK`ing the extract message just redelivers it; on redelivery the document is
+  `CLASSIFYING` and extraction no-ops.
 
 ## 3. Database / storage temporarily unavailable
 
@@ -46,9 +46,10 @@ The two backing stores fail independently and both fail safe:
   redelivered and processed. No work is lost or duplicated.
 - **Redis down.** Workers cannot read or ack; they idle and retry with backoff
   (`Consume` backs off on transient `XREADGROUP` errors). The API can still accept
-  documents — `AcceptDocument` commits to Postgres — and if the subsequent `XADD`
-  fails, the document is left `PENDING` and the reconciler enqueues it once Redis
-  returns. So submission survives a broker outage.
+  documents — `Submit` commits the doc **and** its extract message to the Postgres
+  outbox in one transaction. The relay's `XADD`s simply fail and retry, so the
+  outbox backs up harmlessly and drains once Redis returns. Submission fully
+  survives a broker outage with no lost messages.
 
 ## General principles applied
 
@@ -58,5 +59,5 @@ The two backing stores fail independently and both fail safe:
 | Idempotency everywhere | Natural-key upserts (extraction); already-classified no-op (classification). |
 | Exactly-once *effect* | Result + counter advance in one transaction. |
 | No stale data after rerun | `run_version` fencing + current-version-scoped queries. |
-| Recover the un-recoverable gap | Reconciler re-enqueues orphaned Postgres state. |
+| No write-then-publish gap | Transactional outbox: state change + message commit together; the relay publishes. |
 | Graceful shutdown | `ctx` cancellation stops consumers cleanly; in-flight messages simply redeliver. |

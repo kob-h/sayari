@@ -23,12 +23,12 @@ Three mechanisms combine, all leaning on **idempotent, at-least-once** processin
 
    This is "at-least-once compute, exactly-once effect." The 30 already-classified
    tokens are skipped; only the remaining 70 run.
-3. **Reconciler backstop.** A loop in the API process periodically asks Postgres
-   for orphaned work — `PENDING`/`EXTRACTING` documents and `PENDING` tokens under
-   a `CLASSIFYING` document — and re-publishes those jobs. This covers the one gap
-   the PEL cannot: a crash *between* a Postgres write and the matching Redis
-   `XADD` (e.g., extraction saved tokens but died before enqueuing all classify
-   jobs). See [ADR-005](adr/ADR-005-consistency-model.md).
+3. **Transactional outbox.** The gap the PEL cannot cover — a crash *between* a
+   state write and its message publish — is eliminated by construction: the
+   message is written to the `outbox` table in the *same transaction* as the state
+   change (extraction writes its tokens and their classify messages together), and
+   the relay publishes it. If the state exists, the message does too. See
+   [ADR-005](adr/ADR-005-consistency-model.md).
 
 Extraction is itself idempotent: tokens are upserted on the natural key
 `(document_id, run_version, sentence, char_offset, text)`, so a re-run extraction
@@ -67,4 +67,5 @@ clients never observe stale tokens even briefly.
 | Is this token done? | `tokens.status` |
 | How far along? | `documents.classified_count` / `total_tokens` |
 | Which run is current? | `documents.run_version` |
-| What work is outstanding? | Postgres rows in non-terminal states (the reconciler's query) — **not** the Redis backlog |
+| What is unpublished? | Rows in the `outbox` table — the relay drains them |
+| What work is outstanding? | Postgres rows in non-terminal states — **not** the Redis backlog |

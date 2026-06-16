@@ -9,8 +9,8 @@ captured in the numbered files alongside it.
 ## Workflow
 
 1. **Plan-first.** The agent read the assignment, explored the available skills,
-   and produced a written plan ([`docs/PLAN.md`](../docs/PLAN.md)) **before writing
-   any code**. I reviewed and approved it explicitly.
+   and produced a written plan **before writing any code**. I reviewed and
+   approved it explicitly.
 2. **Decisions stayed with me.** Key choices were made via direct questions, not
    assumed. I chose Go, chose the messaging approach, and chose the LLM strategy
    (see `02-key-decisions.md`). When I reconsidered the transport mid-plan

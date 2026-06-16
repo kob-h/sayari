@@ -39,8 +39,8 @@ services:
       POSTGRES_DSN: postgres://docpipe:docpipe@postgres:5432/docpipe?sslmode=disable
       REDIS_ADDR: redis:6379
       HTTP_ADDR: ":8080"
-      # Fast recovery windows so the partial-rerun demo resumes promptly.
-      RECONCILE_INTERVAL: "${RECONCILE_INTERVAL:-3s}"
+      # Outbox relay cadence + fast PEL reclaim so partial reruns resume promptly.
+      OUTBOX_POLL_INTERVAL: "${OUTBOX_POLL_INTERVAL:-1s}"
       CLAIM_MIN_IDLE: "${CLAIM_MIN_IDLE:-5s}"
     ports:
       - "8080:8080"

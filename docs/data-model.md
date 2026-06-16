@@ -26,8 +26,8 @@ the typed Go definitions are in [`internal/domain/domain.go`](../internal/domain
 | `id` | `BIGSERIAL` PK | |
 | `document_id` | `TEXT` FK → `documents(id)` `ON DELETE CASCADE` | |
 | `run_version` | `INT` | The run this token belongs to. |
-| `text` | `TEXT` | The extracted snippet. |
-| `nlp_entity_type` | `TEXT` | From extraction: `PERSON`/`ORG`/`GPE`/`DATE`/`MISC`. |
+| `text` | `TEXT` | The extracted snippet (untyped — extraction does not label it). |
+| `context` | `TEXT` | The entity's sentence, captured at extraction, so classification receives "entity text + context". |
 | `page` / `sentence` / `char_offset` | `INT` | Position in the document (offsets are rune-based). |
 | `status` | `TEXT` | `PENDING → CLASSIFIED`. |
 | `classification` | `TEXT?` | From classification: `COMPANY`/`PERSON`/`ADDRESS`/`DATE`/`UNKNOWN`. |
@@ -63,33 +63,3 @@ the number of classified rows.
   involved — serialising any two workers that somehow target the same token.
 - `run_version` fences writes from superseded runs (see
   [Rerun & Recovery](rerun-and-recovery.md)).
-
-## JSON Schema (token)
-
-```json
-{
-  "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "title": "Token",
-  "type": "object",
-  "required": ["id", "document_id", "run_version", "text", "nlp_entity_type", "position", "status"],
-  "properties": {
-    "id": { "type": "integer" },
-    "document_id": { "type": "string" },
-    "run_version": { "type": "integer" },
-    "text": { "type": "string" },
-    "nlp_entity_type": { "enum": ["PERSON", "ORG", "GPE", "DATE", "MISC"] },
-    "position": {
-      "type": "object",
-      "properties": {
-        "page": { "type": "integer" },
-        "sentence": { "type": "integer" },
-        "char_offset": { "type": "integer" }
-      }
-    },
-    "status": { "enum": ["PENDING", "CLASSIFIED"] },
-    "classification": { "enum": ["COMPANY", "PERSON", "ADDRESS", "DATE", "UNKNOWN", null] },
-    "confidence": { "type": ["number", "null"] },
-    "reasoning": { "type": ["string", "null"] }
-  }
-}
-```

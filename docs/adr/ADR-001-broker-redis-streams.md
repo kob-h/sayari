@@ -16,10 +16,6 @@ Use **Redis Streams** with consumer groups as the broker between stages.
 a small `Queue.Broker` interface (`internal/queue`).
 
 ## Alternatives Considered
-- **Postgres-as-queue (`SELECT … FOR UPDATE SKIP LOCKED`).** One dependency and
-  transactional enqueue-with-state, eliminating the two-system consistency gap.
-  Rejected for the POC because it couples transport to the database, contends on
-  the hot table at scale, and demonstrates less about real stage decoupling.
 - **Kafka / NATS JetStream.** Higher throughput and longer retention, but heavier
   to operate and overkill for a local POC.
 - **Synchronous gRPC/REST between stages.** Couples stages, makes back-pressure
@@ -32,5 +28,6 @@ a small `Queue.Broker` interface (`internal/queue`).
   consistency gap with Postgres (addressed in [ADR-005](ADR-005-consistency-model.md)).
 
 ## Trade-offs
-Production realism and operational simplicity are prioritised over the stronger
-single-source consistency that Postgres-as-queue would have offered.
+Production realism and operational simplicity are prioritised; the resulting
+two-source consistency gap is handled by a transactional outbox
+([ADR-005](ADR-005-consistency-model.md)).

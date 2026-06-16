@@ -3,23 +3,22 @@
 For each major decision: the alternatives, why we chose what we did, and what we
 gave up.
 
-## 1. Redis Streams as the broker (vs. Postgres-as-queue, vs. Kafka/NATS)
+## 1. Redis Streams as the broker (vs. Kafka/NATS, vs. synchronous RPC)
 
-- **Alternatives:** (a) Postgres `SELECT … FOR UPDATE SKIP LOCKED` as the queue —
-  one dependency, transactional enqueue with state. (b) Kafka / NATS JetStream —
-  high throughput, durable retention.
+- **Alternatives:** (a) Kafka / NATS JetStream — higher throughput and durable
+  retention. (b) Synchronous gRPC/REST between stages — no broker at all.
 - **Chosen:** Redis Streams with consumer groups.
 - **Why:** It delivers genuine broker semantics — consumer-group load balancing,
   per-message acks, and PEL-based crash redelivery — at near-zero operational cost
-  (one container). That demonstrates the real production decoupling between stages
-  better than coupling the queue to the database, while staying far lighter than
-  Kafka for a POC.
+  (one container), while staying far lighter than Kafka for a POC. Synchronous RPC
+  would couple the stages and make back-pressure and crash recovery the caller's
+  problem, blocking independent scaling.
 - **Given up:** A second system to operate and reason about, and the resulting
   **at-least-once / two-source consistency** problem (Postgres + Redis can momentarily
-  disagree). We pay for this with idempotent consumers and a reconciler. With
-  Postgres-as-queue, enqueue and state change would be one ACID transaction and
-  that class of problem disappears — at the cost of a less realistic architecture
-  and DB queue contention at scale.
+  disagree). We pay for this with idempotent consumers and a **transactional outbox**
+  ([ADR-005](adr/ADR-005-consistency-model.md)): messages are written in the same
+  transaction as the state change and a relay publishes them, so there is no
+  write-then-publish gap.
 
 ## 2. PostgreSQL for state (vs. a document/NoSQL store)
 
@@ -42,8 +41,8 @@ gave up.
 - **Why:** O(1) status reads, and the counter is updated atomically with the row
   it counts, so it cannot drift.
 - **Given up:** A tiny bit of write cost and the theoretical risk of the counter
-  and rows disagreeing — mitigated by doing both in one transaction (and the
-  reconciler/`COUNT` could re-derive it if ever needed).
+  and rows disagreeing — mitigated by doing both in one transaction (and a
+  `COUNT(*)` could re-derive it if ever needed).
 
 ## 4. Separate binaries per stage (vs. one binary with role flags / one process)
 

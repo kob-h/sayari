@@ -8,19 +8,19 @@ Mid-flight prompts that changed direction or kept the agent accountable (verbati
 > better implementation and understanding of a real life production code. apply the
 > needed changes
 
-**Effect:** The plan and architecture were revised from "Postgres-as-queue" to
-**Redis Streams** (consumer groups, acks, PEL crash redelivery), with Postgres
-kept as the single source of truth. This introduced the at-least-once consistency
-model and the reconciler ([ADR-005](../docs/adr/ADR-005-consistency-model.md)).
+**Effect:** The architecture adopted **Redis Streams** (consumer groups, acks, PEL
+crash redelivery) as the broker, with Postgres kept as the single source of truth.
+This introduced the at-least-once consistency model handled by the **transactional
+outbox** ([ADR-005](../docs/adr/ADR-005-consistency-model.md)).
 
 ### Keeping the plan trackable + confirming the diagram
 > i want to access this plan, just make sure to keep a copy of your plan markdown
 > file so i can track your changes, and also just confirming the mermaid diagram is
 > going to be included in the deliverables as well.
 
-**Effect:** The approved plan was committed to the repo at
-[`docs/PLAN.md`](../docs/PLAN.md), and the Mermaid architecture diagram is included
-in [`docs/architecture.md`](../docs/architecture.md).
+**Effect:** The plan was tracked and approved during development, and the Mermaid
+architecture diagram is included in
+[`docs/architecture.md`](../docs/architecture.md).
 
 ### Plan approval
 > I confirm your plan with auto-edits
