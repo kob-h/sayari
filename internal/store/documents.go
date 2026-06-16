@@ -45,109 +45,74 @@ func scanDocument(row pgx.CollectableRow) (domain.Document, error) {
 	return d, err
 }
 
-// BeginExtraction transitions a document PENDING -> EXTRACTING and stamps the
-// extraction start time. It is idempotent and safe under concurrency: it uses a
-// conditional UPDATE so only one worker wins the transition. The returned bool
-// reports whether this call won (true) or the document was already past PENDING
-// (false), in which case the caller should treat extraction as already underway.
+// --- Document Tx primitives -------------------------------------------------
 //
-// It returns the current document (at runVersion) so the worker knows which run
-// it is processing.
-func (s *Store) BeginExtraction(ctx context.Context, id string) (doc domain.Document, won bool, err error) {
-	err = pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
-		d, e := getDocumentTx(ctx, tx, id, true)
-		if e != nil {
-			return e
-		}
-		doc = d
-		if d.Status != domain.DocPending {
-			won = false
-			return nil
-		}
-		_, e = tx.Exec(ctx,
-			`UPDATE documents
-			 SET status='EXTRACTING', extraction_started_at=now(), updated_at=now()
-			 WHERE id=$1`, id)
-		if e != nil {
-			return fmt.Errorf("begin extraction: %w", e)
-		}
-		won = true
-		doc.Status = domain.DocExtracting
-		return nil
-	})
-	return doc, won, err
+// These are unconditional, single-purpose persistence operations. They contain
+// no state-machine decisions: the choice of *which* transition to apply belongs
+// to the service layer (the pipeline workers), which calls these inside a
+// WithinTx unit of work.
+
+// SetExtractionStarted marks a document as EXTRACTING and stamps the start time.
+func (t *Tx) SetExtractionStarted(ctx context.Context, id string) error {
+	if _, err := t.tx.Exec(ctx,
+		`UPDATE documents
+		 SET status='EXTRACTING', extraction_started_at=now(), updated_at=now()
+		 WHERE id=$1`, id); err != nil {
+		return fmt.Errorf("set extraction started: %w", err)
+	}
+	return nil
 }
 
-// SaveExtraction persists extracted entities as tokens and advances the document
-// to CLASSIFYING in a single transaction. It is idempotent: tokens are upserted
-// on their natural key, so a retried extraction converges to the same rows
-// without duplicates. total_tokens is recomputed from the actual token count.
-//
-// It returns the persisted tokens (with their assigned IDs) so the caller can
-// enqueue one classification job per token, and it fences stale runs.
-func (s *Store) SaveExtraction(ctx context.Context, id string, runVersion int, entities []domain.Entity) ([]domain.Token, error) {
-	var tokens []domain.Token
-	err := pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
-		cur, err := getDocumentTx(ctx, tx, id, true)
-		if err != nil {
-			return err
-		}
-		if cur.RunVersion != runVersion {
-			return domain.ErrStaleWrite
-		}
-
-		for _, e := range entities {
-			if _, err := tx.Exec(ctx,
-				`INSERT INTO tokens
-				   (document_id, run_version, text, nlp_entity_type, page, sentence, char_offset, status)
-				 VALUES ($1,$2,$3,$4,$5,$6,$7,'PENDING')
-				 ON CONFLICT (document_id, run_version, sentence, char_offset, text) DO NOTHING`,
-				id, runVersion, e.Text, e.Type, e.Position.Page, e.Position.Sentence, e.Position.CharOffset,
-			); err != nil {
-				return fmt.Errorf("insert token: %w", err)
-			}
-		}
-
-		// Recompute total from the actual rows so reruns/dedup stay consistent.
-		var total int
-		if err := tx.QueryRow(ctx,
-			`SELECT count(*) FROM tokens WHERE document_id=$1 AND run_version=$2`,
-			id, runVersion).Scan(&total); err != nil {
-			return fmt.Errorf("count tokens: %w", err)
-		}
-
-		// Advance to CLASSIFYING. If there are zero tokens, the document is
-		// immediately COMPLETED (nothing to classify).
-		newStatus := domain.DocClassifying
-		completedClause := ""
-		if total == 0 {
-			newStatus = domain.DocCompleted
-			completedClause = ", classification_completed_at=now()"
-		}
-		if _, err := tx.Exec(ctx,
-			`UPDATE documents
-			 SET status=$2, total_tokens=$3,
-			     extraction_completed_at=now(),
-			     classification_started_at=now()`+completedClause+`,
-			     updated_at=now()
-			 WHERE id=$1`, id, newStatus, total); err != nil {
-			return fmt.Errorf("finish extraction: %w", err)
-		}
-
-		rows, _ := tx.Query(ctx,
-			`SELECT `+tokenColumns+` FROM tokens
-			 WHERE document_id=$1 AND run_version=$2 ORDER BY id`, id, runVersion)
-		tks, err := pgx.CollectRows(rows, scanToken)
-		if err != nil {
-			return fmt.Errorf("load tokens: %w", err)
-		}
-		tokens = tks
-		return nil
-	})
-	if err != nil {
-		return nil, err
+// AdvanceToClassifying records the extracted token total and moves the document
+// into the classification stage, stamping the extraction-end / classification-start
+// boundary.
+func (t *Tx) AdvanceToClassifying(ctx context.Context, id string, total int) error {
+	if _, err := t.tx.Exec(ctx,
+		`UPDATE documents
+		 SET status='CLASSIFYING', total_tokens=$2,
+		     extraction_completed_at=now(), classification_started_at=now(),
+		     updated_at=now()
+		 WHERE id=$1`, id, total); err != nil {
+		return fmt.Errorf("advance to classifying: %w", err)
 	}
-	return tokens, nil
+	return nil
+}
+
+// MarkExtractionCompletedEmpty completes a document that extracted zero tokens
+// (nothing to classify), stamping all stage boundaries at once.
+func (t *Tx) MarkExtractionCompletedEmpty(ctx context.Context, id string) error {
+	if _, err := t.tx.Exec(ctx,
+		`UPDATE documents
+		 SET status='COMPLETED', total_tokens=0,
+		     extraction_completed_at=now(), classification_started_at=now(),
+		     classification_completed_at=now(), updated_at=now()
+		 WHERE id=$1`, id); err != nil {
+		return fmt.Errorf("complete empty extraction: %w", err)
+	}
+	return nil
+}
+
+// IncrementClassifiedCount bumps the progress counter by one and returns the new
+// value, so the caller can decide whether the document is now complete.
+func (t *Tx) IncrementClassifiedCount(ctx context.Context, id string) (int, error) {
+	var n int
+	if err := t.tx.QueryRow(ctx,
+		`UPDATE documents SET classified_count = classified_count + 1, updated_at=now()
+		 WHERE id=$1 RETURNING classified_count`, id).Scan(&n); err != nil {
+		return 0, fmt.Errorf("increment classified count: %w", err)
+	}
+	return n, nil
+}
+
+// MarkDocumentCompleted moves a document to COMPLETED and stamps completion time.
+func (t *Tx) MarkDocumentCompleted(ctx context.Context, id string) error {
+	if _, err := t.tx.Exec(ctx,
+		`UPDATE documents
+		 SET status='COMPLETED', classification_completed_at=now(), updated_at=now()
+		 WHERE id=$1`, id); err != nil {
+		return fmt.Errorf("mark document completed: %w", err)
+	}
+	return nil
 }
 
 // MarkFailed transitions a document to FAILED. Used when a stage hits an

@@ -8,7 +8,6 @@ import (
 	"crypto/sha256"
 	"embed"
 	"encoding/hex"
-	"errors"
 	"fmt"
 	"sort"
 	"strings"
@@ -97,88 +96,47 @@ func HashText(text string) string {
 	return hex.EncodeToString(sum[:])
 }
 
-// UpsertResult reports what AcceptDocument did so the caller knows whether to
-// (re)enqueue extraction.
-type UpsertResult struct {
-	Document     domain.Document
-	Enqueue      bool // whether an extract job should be published
-	WasFullRerun bool
+// Tx is a transaction-scoped repository. It exposes the primitive document
+// operations the service layer composes inside a single transaction (a
+// Unit-of-Work). It deliberately carries no business logic — the decision of
+// *which* operation to run for a submit lives in the service layer.
+type Tx struct {
+	tx pgx.Tx
 }
 
-// AcceptDocument creates a new document or applies a rerun, returning the
-// resulting manifest. It is the single entry point for POST /process.
-//
-//   - New document: inserted as PENDING (run_version 1).
-//   - mode=full: tokens are deleted and the manifest reset in one transaction,
-//     with run_version bumped to fence any in-flight workers from the old run.
-//   - mode=partial on a COMPLETED doc: no-op (idempotent); Enqueue is false.
-//   - mode=partial on an active/failed doc: re-enqueue to resume; state is left
-//     intact so already-done work is not repeated.
-func (s *Store) AcceptDocument(ctx context.Context, id, text string, mode domain.RerunMode) (UpsertResult, error) {
-	hash := HashText(text)
-	var res UpsertResult
-
-	err := pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
-		existing, err := getDocumentTx(ctx, tx, id, true)
-		switch {
-		case errors.Is(err, domain.ErrNotFound):
-			doc, err := insertDocument(ctx, tx, id, text, hash)
-			if err != nil {
-				return err
-			}
-			res = UpsertResult{Document: doc, Enqueue: true}
-			return nil
-		case err != nil:
-			return err
-		}
-
-		if mode == domain.RerunFull {
-			doc, err := resetDocument(ctx, tx, id, text, hash)
-			if err != nil {
-				return err
-			}
-			res = UpsertResult{Document: doc, Enqueue: true, WasFullRerun: true}
-			return nil
-		}
-
-		// Partial mode.
-		if existing.Status == domain.DocCompleted {
-			res = UpsertResult{Document: existing, Enqueue: false}
-			return nil
-		}
-		// Resume an active or failed document. Move FAILED back to PENDING so the
-		// extractor will pick it up again; leave others as-is.
-		if existing.Status == domain.DocFailed {
-			if _, err := tx.Exec(ctx,
-				`UPDATE documents SET status='PENDING', updated_at=now() WHERE id=$1`, id); err != nil {
-				return fmt.Errorf("reset failed doc: %w", err)
-			}
-			existing.Status = domain.DocPending
-		}
-		res = UpsertResult{Document: existing, Enqueue: true}
-		return nil
+// WithinTx runs fn inside a single database transaction, giving it a Tx repository
+// bound to that transaction. The transaction commits if fn returns nil and rolls
+// back otherwise. This lets callers perform read-modify-write sequences (e.g. the
+// submit decision) atomically without the store owning the decision.
+func (s *Store) WithinTx(ctx context.Context, fn func(context.Context, *Tx) error) error {
+	return pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
+		return fn(ctx, &Tx{tx: tx})
 	})
-	if err != nil {
-		return UpsertResult{}, err
-	}
-	return res, nil
 }
 
-func insertDocument(ctx context.Context, tx pgx.Tx, id, text, hash string) (domain.Document, error) {
-	_, err := tx.Exec(ctx,
+// GetDocumentForUpdate returns the document, locking its row for the rest of the
+// transaction, or domain.ErrNotFound.
+func (t *Tx) GetDocumentForUpdate(ctx context.Context, id string) (domain.Document, error) {
+	return getDocumentTx(ctx, t.tx, id, true)
+}
+
+// InsertDocument creates a new PENDING document at run_version 1.
+func (t *Tx) InsertDocument(ctx context.Context, id, text string) (domain.Document, error) {
+	if _, err := t.tx.Exec(ctx,
 		`INSERT INTO documents (id, text, content_hash, status, run_version)
-		 VALUES ($1, $2, $3, 'PENDING', 1)`, id, text, hash)
-	if err != nil {
+		 VALUES ($1, $2, $3, 'PENDING', 1)`, id, text, HashText(text)); err != nil {
 		return domain.Document{}, fmt.Errorf("insert document: %w", err)
 	}
-	return getDocumentTx(ctx, tx, id, false)
+	return getDocumentTx(ctx, t.tx, id, false)
 }
 
-func resetDocument(ctx context.Context, tx pgx.Tx, id, text, hash string) (domain.Document, error) {
-	if _, err := tx.Exec(ctx, `DELETE FROM tokens WHERE document_id=$1`, id); err != nil {
+// ResetDocument deletes the document's tokens and resets its manifest to a fresh
+// PENDING run, bumping run_version to fence any in-flight workers from the old run.
+func (t *Tx) ResetDocument(ctx context.Context, id, text string) (domain.Document, error) {
+	if _, err := t.tx.Exec(ctx, `DELETE FROM tokens WHERE document_id=$1`, id); err != nil {
 		return domain.Document{}, fmt.Errorf("delete tokens: %w", err)
 	}
-	_, err := tx.Exec(ctx,
+	if _, err := t.tx.Exec(ctx,
 		`UPDATE documents
 		 SET text=$2, content_hash=$3, status='PENDING',
 		     run_version = run_version + 1,
@@ -186,9 +144,18 @@ func resetDocument(ctx context.Context, tx pgx.Tx, id, text, hash string) (domai
 		     extraction_started_at=NULL, extraction_completed_at=NULL,
 		     classification_started_at=NULL, classification_completed_at=NULL,
 		     updated_at=now()
-		 WHERE id=$1`, id, text, hash)
-	if err != nil {
+		 WHERE id=$1`, id, text, HashText(text)); err != nil {
 		return domain.Document{}, fmt.Errorf("reset document: %w", err)
 	}
-	return getDocumentTx(ctx, tx, id, false)
+	return getDocumentTx(ctx, t.tx, id, false)
+}
+
+// SetDocumentPending moves a document back to PENDING (used to resume a FAILED
+// document without discarding completed work).
+func (t *Tx) SetDocumentPending(ctx context.Context, id string) error {
+	if _, err := t.tx.Exec(ctx,
+		`UPDATE documents SET status='PENDING', updated_at=now() WHERE id=$1`, id); err != nil {
+		return fmt.Errorf("set document pending: %w", err)
+	}
+	return nil
 }

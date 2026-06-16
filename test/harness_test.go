@@ -1,8 +1,8 @@
 // Package integration_test exercises the whole pipeline end-to-end against real
 // Postgres and Redis containers (via testcontainers-go). The API is driven over
 // HTTP exactly as a client would, and the extraction/classification workers plus
-// the reconciler run in-process. These tests are the executable proof of the six
-// required scenarios.
+// the outbox relay run in-process. These tests are the executable proof of the
+// six required scenarios.
 //
 // They are skipped under `go test -short` and require a working Docker daemon.
 package integration_test
@@ -30,9 +30,10 @@ import (
 	"github.com/kob-h/docpipeline/internal/api"
 	"github.com/kob-h/docpipeline/internal/llm"
 	"github.com/kob-h/docpipeline/internal/nlp"
+	"github.com/kob-h/docpipeline/internal/outbox"
 	"github.com/kob-h/docpipeline/internal/pipeline"
 	"github.com/kob-h/docpipeline/internal/queue"
-	"github.com/kob-h/docpipeline/internal/reconciler"
+	"github.com/kob-h/docpipeline/internal/service"
 	"github.com/kob-h/docpipeline/internal/store"
 )
 
@@ -130,11 +131,11 @@ func newEnv(t *testing.T, classifyDelay time.Duration) *env {
 		t.Fatalf("migrate: %v", err)
 	}
 	// Clean slate so tests are independent.
-	if _, err := stExec(ctx, st, `TRUNCATE tokens, documents RESTART IDENTITY CASCADE`); err != nil {
+	if _, err := stExec(ctx, st, `TRUNCATE tokens, documents, outbox RESTART IDENTITY CASCADE`); err != nil {
 		t.Fatalf("truncate: %v", err)
 	}
 
-	// Short reclaim/reconcile windows so recovery is fast in tests.
+	// Short PEL-reclaim window so crash recovery is fast in tests.
 	broker := queue.NewRedisBroker(redisAddr, "", 300*time.Millisecond, log)
 	if err := flushRedis(ctx, broker); err != nil {
 		t.Fatalf("flush redis: %v", err)
@@ -142,15 +143,18 @@ func newEnv(t *testing.T, classifyDelay time.Duration) *env {
 
 	e := &env{t: t, store: st, broker: broker, rootCancel: cancel, classDelay: classifyDelay}
 
-	// Extraction worker + reconciler run for the whole test under the root ctx.
+	// Extraction worker + outbox relay run for the whole test under the root ctx.
+	// The relay is what publishes producers' messages, so it must run for any work
+	// to flow.
 	ext := pipeline.NewExtractionWorker(st, broker, nlp.NewMockExtractor(), 4, log)
 	go func() { _ = ext.Run(ctx) }()
-	rec := reconciler.New(st, broker, 500*time.Millisecond, log)
-	go func() { _ = rec.Run(ctx) }()
+	relay := outbox.New(st, broker, 200*time.Millisecond, log)
+	go func() { _ = relay.Run(ctx) }()
 
 	e.startClassifier()
 
-	e.server = httptest.NewServer(api.NewServer(st, broker, log).Handler())
+	svc := service.NewDocumentService(st, broker, log)
+	e.server = httptest.NewServer(api.NewServer(svc, log).Handler())
 
 	t.Cleanup(func() {
 		e.server.Close()

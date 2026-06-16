@@ -12,7 +12,7 @@ import (
 	"github.com/kob-h/docpipeline/internal/domain"
 )
 
-const tokenColumns = `id, document_id, run_version, text, nlp_entity_type,
+const tokenColumns = `id, document_id, run_version, text, context,
 	page, sentence, char_offset, status, classification, confidence, reasoning,
 	created_at, classified_at`
 
@@ -20,7 +20,7 @@ func scanToken(row pgx.CollectableRow) (domain.Token, error) {
 	var t domain.Token
 	var class *string
 	err := row.Scan(
-		&t.ID, &t.DocumentID, &t.RunVersion, &t.Text, &t.NLPEntityType,
+		&t.ID, &t.DocumentID, &t.RunVersion, &t.Text, &t.Context,
 		&t.Position.Page, &t.Position.Sentence, &t.Position.CharOffset,
 		&t.Status, &class, &t.Confidence, &t.Reasoning,
 		&t.CreatedAt, &t.ClassifiedAt,
@@ -45,71 +45,74 @@ func (s *Store) GetToken(ctx context.Context, id int64) (domain.Token, error) {
 	return t, err
 }
 
-// ApplyClassification persists a token's classification and advances the
-// document's progress counter in a single transaction. This atomicity is the
-// crux of crash safety: the result and the counter move together, so the
-// "classified count" can never diverge from the classified rows.
+// --- Token Tx primitives ----------------------------------------------------
 //
-// It is idempotent. If the token is already CLASSIFIED (e.g. a redelivered
-// message), it is a no-op and the counter is not double-incremented. Stale runs
-// (runVersion behind the document) are rejected with domain.ErrStaleWrite.
-//
-// When the increment makes classified_count reach total_tokens, the document is
-// transitioned to COMPLETED and classification_completed_at is stamped.
-func (s *Store) ApplyClassification(ctx context.Context, tokenID int64, runVersion int, c domain.Classification) error {
-	return pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
-		// Lock the token row to serialise concurrent attempts on the same token.
-		var (
-			docID  string
-			status domain.TokenStatus
-			tokRun int
-		)
-		err := tx.QueryRow(ctx,
-			`SELECT document_id, status, run_version FROM tokens WHERE id=$1 FOR UPDATE`, tokenID).
-			Scan(&docID, &status, &tokRun)
-		if errors.Is(err, pgx.ErrNoRows) {
-			return domain.ErrNotFound
-		}
-		if err != nil {
-			return fmt.Errorf("lock token: %w", err)
-		}
-		if tokRun != runVersion {
-			return domain.ErrStaleWrite
-		}
-		if status == domain.TokenClassified {
-			return nil // idempotent: already done, do not double-count
-		}
+// Single-purpose persistence operations with no state-machine decisions. The
+// classification service (the pipeline classification worker) composes these
+// inside a WithinTx unit of work and owns the idempotency / stale-run / completion
+// decisions.
 
-		// Guard against a superseded run at the document level too.
-		var docRun int
-		if err := tx.QueryRow(ctx,
-			`SELECT run_version FROM documents WHERE id=$1 FOR UPDATE`, docID).Scan(&docRun); err != nil {
-			return fmt.Errorf("lock document: %w", err)
+// UpsertTokens inserts the entities as PENDING tokens, idempotently on their
+// natural key (a retried extraction converges to the same rows, no duplicates).
+func (t *Tx) UpsertTokens(ctx context.Context, docID string, runVersion int, entities []domain.Entity) error {
+	for _, e := range entities {
+		if _, err := t.tx.Exec(ctx,
+			`INSERT INTO tokens
+			   (document_id, run_version, text, context, page, sentence, char_offset, status)
+			 VALUES ($1,$2,$3,$4,$5,$6,$7,'PENDING')
+			 ON CONFLICT (document_id, run_version, sentence, char_offset, text) DO NOTHING`,
+			docID, runVersion, e.Text, e.Context, e.Position.Page, e.Position.Sentence, e.Position.CharOffset,
+		); err != nil {
+			return fmt.Errorf("insert token: %w", err)
 		}
-		if docRun != runVersion {
-			return domain.ErrStaleWrite
-		}
+	}
+	return nil
+}
 
-		if _, err := tx.Exec(ctx,
-			`UPDATE tokens
-			 SET status='CLASSIFIED', classification=$2, confidence=$3, reasoning=$4, classified_at=now()
-			 WHERE id=$1`, tokenID, string(c.Category), c.Confidence, c.Reasoning); err != nil {
-			return fmt.Errorf("update token: %w", err)
-		}
+// CountTokens returns how many tokens exist for a document's run.
+func (t *Tx) CountTokens(ctx context.Context, docID string, runVersion int) (int, error) {
+	var n int
+	if err := t.tx.QueryRow(ctx,
+		`SELECT count(*) FROM tokens WHERE document_id=$1 AND run_version=$2`,
+		docID, runVersion).Scan(&n); err != nil {
+		return 0, fmt.Errorf("count tokens: %w", err)
+	}
+	return n, nil
+}
 
-		if _, err := tx.Exec(ctx,
-			`UPDATE documents
-			 SET classified_count = classified_count + 1,
-			     status = CASE WHEN classified_count + 1 >= total_tokens THEN 'COMPLETED' ELSE status END,
-			     classification_completed_at = CASE
-			         WHEN classified_count + 1 >= total_tokens THEN now()
-			         ELSE classification_completed_at END,
-			     updated_at = now()
-			 WHERE id=$1`, docID); err != nil {
-			return fmt.Errorf("advance progress: %w", err)
-		}
-		return nil
-	})
+// ListTokensForRun returns all tokens for a document's run, ordered by id.
+func (t *Tx) ListTokensForRun(ctx context.Context, docID string, runVersion int) ([]domain.Token, error) {
+	rows, _ := t.tx.Query(ctx,
+		`SELECT `+tokenColumns+` FROM tokens
+		 WHERE document_id=$1 AND run_version=$2 ORDER BY id`, docID, runVersion)
+	tokens, err := pgx.CollectRows(rows, scanToken)
+	if err != nil {
+		return nil, fmt.Errorf("load tokens: %w", err)
+	}
+	return tokens, nil
+}
+
+// GetTokenForUpdate returns a token, locking its row for the rest of the
+// transaction, or domain.ErrNotFound.
+func (t *Tx) GetTokenForUpdate(ctx context.Context, id int64) (domain.Token, error) {
+	rows, _ := t.tx.Query(ctx, `SELECT `+tokenColumns+` FROM tokens WHERE id=$1 FOR UPDATE`, id)
+	tok, err := pgx.CollectExactlyOneRow(rows, scanToken)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return domain.Token{}, domain.ErrNotFound
+	}
+	return tok, err
+}
+
+// SetTokenClassified records a token's classification result and marks it
+// CLASSIFIED.
+func (t *Tx) SetTokenClassified(ctx context.Context, id int64, c domain.Classification) error {
+	if _, err := t.tx.Exec(ctx,
+		`UPDATE tokens
+		 SET status='CLASSIFIED', classification=$2, confidence=$3, reasoning=$4, classified_at=now()
+		 WHERE id=$1`, id, string(c.Category), c.Confidence, c.Reasoning); err != nil {
+		return fmt.Errorf("update token: %w", err)
+	}
+	return nil
 }
 
 // ListTokens returns tokens for a document (current run only) matching filter.
@@ -127,9 +130,6 @@ func (s *Store) ListTokens(ctx context.Context, docID string, f domain.TokenFilt
 	}
 	if f.Classification != nil {
 		add(`classification =`, string(*f.Classification))
-	}
-	if f.NLPEntityType != nil {
-		add(`nlp_entity_type =`, string(*f.NLPEntityType))
 	}
 	if f.Status != nil {
 		add(`status =`, string(*f.Status))
@@ -150,55 +150,4 @@ func (s *Store) ListTokens(ctx context.Context, docID string, f domain.TokenFilt
 
 	rows, _ := s.pool.Query(ctx, q, args...)
 	return pgx.CollectRows(rows, scanToken)
-}
-
-// OrphanJob describes a unit of work the reconciler must re-enqueue.
-type OrphanJob struct {
-	Kind       string // "extract" or "classify"
-	DocumentID string
-	TokenID    int64 // set when Kind == "classify"
-	RunVersion int
-}
-
-// FindOrphans returns work that should be in flight but may have been lost
-// between a Postgres write and a Redis publish (the only place the two systems
-// can disagree). The reconciler republishes these jobs. Because all consumers
-// are idempotent, re-enqueuing already-in-flight work is harmless.
-//
-//   - Documents stuck in PENDING/EXTRACTING -> need an extract job.
-//   - Tokens still PENDING under a CLASSIFYING document -> need a classify job.
-func (s *Store) FindOrphans(ctx context.Context, limit int) ([]OrphanJob, error) {
-	var jobs []OrphanJob
-
-	docRows, _ := s.pool.Query(ctx,
-		`SELECT id, run_version FROM documents
-		 WHERE status IN ('PENDING','EXTRACTING')
-		 ORDER BY updated_at ASC LIMIT $1`, limit)
-	docs, err := pgx.CollectRows(docRows, func(r pgx.CollectableRow) (OrphanJob, error) {
-		var j OrphanJob
-		j.Kind = "extract"
-		return j, r.Scan(&j.DocumentID, &j.RunVersion)
-	})
-	if err != nil {
-		return nil, fmt.Errorf("find orphan documents: %w", err)
-	}
-	jobs = append(jobs, docs...)
-
-	tokRows, _ := s.pool.Query(ctx,
-		`SELECT t.id, t.document_id, t.run_version
-		 FROM tokens t
-		 JOIN documents d ON d.id = t.document_id AND d.run_version = t.run_version
-		 WHERE t.status='PENDING' AND d.status='CLASSIFYING'
-		 ORDER BY t.created_at ASC LIMIT $1`, limit)
-	toks, err := pgx.CollectRows(tokRows, func(r pgx.CollectableRow) (OrphanJob, error) {
-		var j OrphanJob
-		j.Kind = "classify"
-		return j, r.Scan(&j.TokenID, &j.DocumentID, &j.RunVersion)
-	})
-	if err != nil {
-		return nil, fmt.Errorf("find orphan tokens: %w", err)
-	}
-	jobs = append(jobs, toks...)
-
-	return jobs, nil
 }
