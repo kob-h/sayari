@@ -10,10 +10,10 @@ import (
 	"github.com/kob-h/docpipeline/internal/domain"
 )
 
-// MockClassifier is a deterministic Classifier. It maps the NLP entity type to a
-// business category, applies a few text heuristics, and derives a stable
-// pseudo-confidence from the token text so output looks realistic and is
-// reproducible across runs.
+// MockClassifier is a deterministic Classifier. Given only the token text and
+// its context (extraction does not provide a type), it applies ordered
+// rule-based heuristics to decide the business category and derives a stable
+// pseudo-confidence so output looks realistic and is reproducible across runs.
 type MockClassifier struct {
 	// delay optionally simulates per-token LLM latency so progress and
 	// partial-rerun behaviour are observable. Zero means no delay.
@@ -37,9 +37,13 @@ func NewMockClassifier(opts ...MockOption) *MockClassifier {
 	return m
 }
 
+// Classification rules, evaluated in order against the token text. These live in
+// the classifier (not the extractor) because labeling is the classifier's job.
 var (
-	orgSuffix     = regexp.MustCompile(`(?i)\b(inc|corp|corporation|company|co|ltd|llc|plc|group|technologies|systems|holdings|bank|partners|capital|university|institute)\b`)
-	addressPrefix = regexp.MustCompile(`^\d{1,5}\s`)
+	dateRe        = regexp.MustCompile(`(?i)^(?:(?:January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{1,2}|(?:19|20)\d{2}|\d{1,2}/\d{1,2}/\d{2,4})`)
+	addressPrefix = regexp.MustCompile(`^\d{1,5}\s+[A-Za-z]`)
+	orgSuffix     = regexp.MustCompile(`(?i)\b(inc|incorporated|corp|corporation|company|co|ltd|llc|plc|group|technologies|systems|solutions|holdings|industries|bank|partners|capital|ventures|university|institute|association|foundation|agency)\b`)
+	personRe      = regexp.MustCompile(`^(?:(?:Mr|Mrs|Ms|Dr|Prof|President|CEO|CFO|CTO|Senator|Governor|Mayor|Chairman)\.?\s+)?[A-Z][a-z]+(?:\s+[A-Z]\.)?(?:\s+[A-Z][a-z]+){1,2}$`)
 )
 
 // Classify implements Classifier.
@@ -59,30 +63,22 @@ func (m MockClassifier) Classify(ctx context.Context, tok domain.Token) (domain.
 	}, nil
 }
 
+// classify decides the business category from the token text alone (the context
+// is available on tok and would be used by a real model; the deterministic stub
+// keys off the surface form). Rules are ordered most-specific first.
 func classify(tok domain.Token) (domain.Category, string) {
 	text := strings.TrimSpace(tok.Text)
-	switch tok.NLPEntityType {
-	case domain.EntityDate:
-		return domain.CategoryDate, "NLP tagged a temporal expression"
-	case domain.EntityOrg:
-		return domain.CategoryCompany, "organization name with corporate form"
-	case domain.EntityPerson:
+	switch {
+	case dateRe.MatchString(text):
+		return domain.CategoryDate, "matches a date/temporal pattern"
+	case addressPrefix.MatchString(text):
+		return domain.CategoryAddress, "leading street number indicates a postal address"
+	case orgSuffix.MatchString(text):
+		return domain.CategoryCompany, "contains a corporate suffix"
+	case personRe.MatchString(text):
 		return domain.CategoryPerson, "capitalized personal-name pattern"
-	case domain.EntityGPE:
-		if addressPrefix.MatchString(text) {
-			return domain.CategoryAddress, "leading street number indicates a postal address"
-		}
-		return domain.CategoryAddress, "geo-political / location reference"
 	default:
-		// MISC or unknown: fall back to light text heuristics.
-		switch {
-		case addressPrefix.MatchString(text):
-			return domain.CategoryAddress, "leading street number indicates a postal address"
-		case orgSuffix.MatchString(text):
-			return domain.CategoryCompany, "contains a corporate suffix"
-		default:
-			return domain.CategoryUnknown, "no confident signal from NLP type or text"
-		}
+		return domain.CategoryUnknown, "no confident signal from the token text"
 	}
 }
 

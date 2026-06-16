@@ -33,7 +33,9 @@ CREATE TABLE IF NOT EXISTS tokens (
     document_id     TEXT        NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
     run_version     INTEGER     NOT NULL,
     text            TEXT        NOT NULL,
-    nlp_entity_type TEXT        NOT NULL,
+    -- Surrounding text (the entity's sentence) captured at extraction, so the
+    -- classifier receives "entity text + context" per the interface contract.
+    context         TEXT        NOT NULL DEFAULT '',
     page            INTEGER     NOT NULL DEFAULT 1,
     sentence        INTEGER     NOT NULL DEFAULT 0,
     char_offset     INTEGER     NOT NULL DEFAULT 0,

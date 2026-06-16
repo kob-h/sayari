@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync/atomic"
 	"testing"
 
@@ -17,19 +18,30 @@ func quietLogger() *slog.Logger {
 }
 
 func TestOllamaClassifier_ParsesStructuredResponse(t *testing.T) {
+	var gotBody string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if got := r.Header.Get("Authorization"); got != "Bearer test-key" {
 			t.Errorf("missing/incorrect auth header: %q", got)
 		}
+		b, _ := io.ReadAll(r.Body)
+		gotBody = string(b)
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = io.WriteString(w, `{"message":{"role":"assistant","content":"{\"category\":\"COMPANY\",\"confidence\":0.91,\"reasoning\":\"corporate suffix\"}"}}`)
 	}))
 	defer srv.Close()
 
 	c := NewOllamaClassifier(srv.URL, "test-key", "test-model", quietLogger())
-	got, err := c.Classify(context.Background(), domain.Token{Text: "Acme Corp", NLPEntityType: domain.EntityOrg})
+	got, err := c.Classify(context.Background(), domain.Token{
+		Text:    "Acme Corp",
+		Context: "He works at Acme Corp downtown.",
+	})
 	if err != nil {
 		t.Fatalf("Classify: %v", err)
+	}
+	// The token's context must be passed to the model (interface requires
+	// "entity text + context").
+	if !strings.Contains(gotBody, "Acme Corp downtown") {
+		t.Errorf("request body should include the token context, got: %s", gotBody)
 	}
 	if got.Category != domain.CategoryCompany {
 		t.Errorf("category: got %s, want COMPANY", got.Category)

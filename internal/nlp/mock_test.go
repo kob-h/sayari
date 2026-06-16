@@ -2,6 +2,7 @@ package nlp
 
 import (
 	"context"
+	"strings"
 	"testing"
 
 	"github.com/kob-h/docpipeline/internal/domain"
@@ -16,19 +17,20 @@ func extract(t *testing.T, text string) []domain.Entity {
 	return ents
 }
 
-func TestMockExtractor_Types(t *testing.T) {
+// Extraction finds candidate spans but does NOT label them (the classifier does
+// that). So we assert the right text snippets are located, with no type.
+func TestMockExtractor_FindsCandidateSpans(t *testing.T) {
 	tests := []struct {
 		name string
 		text string
-		want domain.EntityType
 		find string
 	}{
-		{"person", "Jane Doe joined the firm.", domain.EntityPerson, "Jane Doe"},
-		{"org", "He works at Acme Corporation today.", domain.EntityOrg, "Acme Corporation"},
-		{"org_llc", "The deal involved Globex LLC.", domain.EntityOrg, "Globex LLC"},
-		{"address", "Visit us at 123 Main Street.", domain.EntityGPE, "123 Main Street"},
-		{"date_month", "It happened on March 3, 2024.", domain.EntityDate, "March 3, 2024"},
-		{"date_year", "The company grew in 2019.", domain.EntityDate, "2019"},
+		{"person", "Jane Doe joined the firm.", "Jane Doe"},
+		{"org", "He works at Acme Corporation today.", "Acme Corporation"},
+		{"org_llc", "The deal involved Globex LLC.", "Globex LLC"},
+		{"address", "Visit us at 123 Main Street.", "123 Main Street"},
+		{"date_month", "It happened on March 3, 2024.", "March 3, 2024"},
+		{"date_year", "The company grew in 2019.", "2019"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -37,13 +39,10 @@ func TestMockExtractor_Types(t *testing.T) {
 			for _, e := range ents {
 				if e.Text == tt.find {
 					found = true
-					if e.Type != tt.want {
-						t.Errorf("entity %q: got type %s, want %s", tt.find, e.Type, tt.want)
-					}
 				}
 			}
 			if !found {
-				t.Errorf("expected to find entity %q in %+v", tt.find, ents)
+				t.Errorf("expected to find candidate span %q in %+v", tt.find, ents)
 			}
 		})
 	}
@@ -96,5 +95,19 @@ func TestMockExtractor_Deterministic(t *testing.T) {
 func TestMockExtractor_EmptyDocument(t *testing.T) {
 	if ents := extract(t, ""); len(ents) != 0 {
 		t.Errorf("empty doc should yield no entities, got %+v", ents)
+	}
+}
+
+func TestMockExtractor_CapturesContext(t *testing.T) {
+	// Each entity must carry its sentence as context, so the classifier receives
+	// "entity text + context" per the interface contract.
+	ents := extract(t, "Acme Corporation grew fast. Jane Doe arrived in Washington later.")
+	for _, e := range ents {
+		if e.Context == "" {
+			t.Errorf("entity %q has empty context", e.Text)
+		}
+		if !strings.Contains(e.Context, e.Text) {
+			t.Errorf("context %q should contain the entity text %q", e.Context, e.Text)
+		}
 	}
 }

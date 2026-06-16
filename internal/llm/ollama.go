@@ -107,7 +107,12 @@ Respond ONLY with the requested JSON. Confidence is a number between 0 and 1.`
 
 // Classify implements Classifier.
 func (o *OllamaClassifier) Classify(ctx context.Context, tok domain.Token) (domain.Classification, error) {
-	user := fmt.Sprintf("Token: %q\nNLP entity type: %s\nClassify this token.", tok.Text, tok.NLPEntityType)
+	sentence := tok.Context
+	if sentence == "" {
+		sentence = "(none)"
+	}
+	user := fmt.Sprintf("Token: %q\nContext (the sentence it appears in): %q\nClassify this token.",
+		tok.Text, sentence)
 	reqBody := chatRequest{
 		Model: o.model,
 		Messages: []chatMessage{

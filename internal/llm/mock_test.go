@@ -7,29 +7,33 @@ import (
 	"github.com/kob-h/docpipeline/internal/domain"
 )
 
-func TestMockClassifier_Mapping(t *testing.T) {
+// The classifier decides the category from the token text alone (extraction
+// provides no type).
+func TestMockClassifier_Classifies(t *testing.T) {
 	tests := []struct {
 		name string
-		tok  domain.Token
+		text string
 		want domain.Category
 	}{
-		{"org->company", domain.Token{Text: "Acme Corporation", NLPEntityType: domain.EntityOrg}, domain.CategoryCompany},
-		{"person", domain.Token{Text: "Jane Doe", NLPEntityType: domain.EntityPerson}, domain.CategoryPerson},
-		{"date", domain.Token{Text: "March 3, 2024", NLPEntityType: domain.EntityDate}, domain.CategoryDate},
-		{"gpe-address", domain.Token{Text: "123 Main Street", NLPEntityType: domain.EntityGPE}, domain.CategoryAddress},
-		{"misc-address", domain.Token{Text: "450 Lakeshore Avenue", NLPEntityType: domain.EntityMisc}, domain.CategoryAddress},
-		{"misc-org-suffix", domain.Token{Text: "Globex Inc", NLPEntityType: domain.EntityMisc}, domain.CategoryCompany},
-		{"misc-unknown", domain.Token{Text: "purple monkey", NLPEntityType: domain.EntityMisc}, domain.CategoryUnknown},
+		{"company", "Acme Corporation", domain.CategoryCompany},
+		{"company-inc", "Globex Inc", domain.CategoryCompany},
+		{"person", "Jane Doe", domain.CategoryPerson},
+		{"person-title", "Dr Helen Park", domain.CategoryPerson},
+		{"date-month", "March 3, 2024", domain.CategoryDate},
+		{"date-year", "2019", domain.CategoryDate},
+		{"address", "123 Main Street", domain.CategoryAddress},
+		{"address-ave", "450 Lakeshore Avenue", domain.CategoryAddress},
+		{"unknown", "purple monkey", domain.CategoryUnknown},
 	}
 	c := NewMockClassifier()
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got, err := c.Classify(context.Background(), tt.tok)
+			got, err := c.Classify(context.Background(), domain.Token{Text: tt.text})
 			if err != nil {
 				t.Fatalf("Classify: %v", err)
 			}
 			if got.Category != tt.want {
-				t.Errorf("category: got %s, want %s", got.Category, tt.want)
+				t.Errorf("text %q: got %s, want %s", tt.text, got.Category, tt.want)
 			}
 			if got.Confidence < 0 || got.Confidence > 1 {
 				t.Errorf("confidence out of range: %v", got.Confidence)
@@ -43,7 +47,7 @@ func TestMockClassifier_Mapping(t *testing.T) {
 
 func TestMockClassifier_DeterministicConfidence(t *testing.T) {
 	c := NewMockClassifier()
-	tok := domain.Token{Text: "Acme Corporation", NLPEntityType: domain.EntityOrg}
+	tok := domain.Token{Text: "Acme Corporation"}
 	a, _ := c.Classify(context.Background(), tok)
 	b, _ := c.Classify(context.Background(), tok)
 	if a != b {

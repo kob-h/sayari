@@ -54,19 +54,6 @@ const (
 	TokenClassified TokenStatus = "CLASSIFIED"
 )
 
-// EntityType is the coarse type assigned by the NLP extraction stage. It mirrors
-// common NLP labels (e.g. spaCy) and is intentionally distinct from the
-// downstream business Category produced by classification.
-type EntityType string
-
-const (
-	EntityPerson EntityType = "PERSON" // a person's name
-	EntityOrg    EntityType = "ORG"    // an organization / company
-	EntityGPE    EntityType = "GPE"    // geo-political entity (location)
-	EntityDate   EntityType = "DATE"   // a date or time expression
-	EntityMisc   EntityType = "MISC"   // anything else the NLP stage is unsure about
-)
-
 // Category is the business classification produced by the LLM stage.
 type Category string
 
@@ -107,12 +94,17 @@ type Position struct {
 	CharOffset int `json:"char_offset"`
 }
 
-// Entity is a raw extraction result returned by an Extractor. It carries no
-// processing state; the store turns it into a Token.
+// Entity is a raw extraction result returned by an Extractor: a candidate token
+// (text snippet) and where it was found. Extraction does not label entities — the
+// classifier alone assigns a Category. It carries no processing state; the store
+// turns it into a Token.
 type Entity struct {
-	Text     string     `json:"text"`
-	Type     EntityType `json:"type"`
-	Position Position   `json:"position"`
+	Text string `json:"text"`
+	// Context is the surrounding text (the entity's sentence) captured at
+	// extraction time. It travels with the entity so the classification stage
+	// receives "entity text + context" and can disambiguate by surroundings.
+	Context  string   `json:"context"`
+	Position Position `json:"position"`
 }
 
 // Document is the manifest for a single document's processing run. It is the
@@ -142,13 +134,13 @@ type Document struct {
 // stored and processed individually so classification can scale per-token and
 // resume mid-document.
 type Token struct {
-	ID            int64       `json:"id"`
-	DocumentID    string      `json:"document_id"`
-	RunVersion    int         `json:"run_version"`
-	Text          string      `json:"text"`
-	NLPEntityType EntityType  `json:"nlp_entity_type"`
-	Position      Position    `json:"position"`
-	Status        TokenStatus `json:"status"`
+	ID         int64       `json:"id"`
+	DocumentID string      `json:"document_id"`
+	RunVersion int         `json:"run_version"`
+	Text       string      `json:"text"`
+	Context    string      `json:"context"`
+	Position   Position    `json:"position"`
+	Status     TokenStatus `json:"status"`
 
 	Classification *Category `json:"classification,omitempty"`
 	Confidence     *float64  `json:"confidence,omitempty"`
@@ -181,7 +173,6 @@ func (d Document) Durations() (extraction, classification time.Duration) {
 // value matches every token for a document.
 type TokenFilter struct {
 	Classification *Category
-	NLPEntityType  *EntityType
 	Status         *TokenStatus
 	Page           *int
 	Limit          int

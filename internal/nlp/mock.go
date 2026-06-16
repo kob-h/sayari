@@ -11,32 +11,38 @@ import (
 )
 
 // MockExtractor is a deterministic, rule-based Extractor. It uses ordered
-// regular expressions to find dates, addresses, organizations, and people, and
-// returns realistic positions (sentence index and rune offset). It is
-// dependency-free and reproducible, which makes the pipeline easy to test
-// end-to-end without a real NLP service.
+// regular expressions to find candidate entity spans (date-like, address-like,
+// organization-like, and person-like text) and returns each as an untyped token
+// with its sentence as context and its position. Per the pipeline's contract,
+// extraction does NOT label entities — it only locates candidate tokens; the
+// classifier decides what each one is. The patterns here serve only to find
+// plausible spans, not to categorize them. Dependency-free and reproducible.
 type MockExtractor struct {
 	rules []rule
 }
 
 type rule struct {
-	typ domain.EntityType
-	re  *regexp.Regexp
+	// nameLike marks the person/proper-noun pattern, the only one that needs the
+	// title/headline filtering below. It does not label the emitted token.
+	nameLike bool
+	re       *regexp.Regexp
 }
 
-// patterns are evaluated in priority order; earlier matches win over later
-// overlapping ones (so "Acme Corp" is an ORG, not a PERSON).
+// Patterns are evaluated in priority order; earlier matches win over later
+// overlapping ones (so "Acme Corp" is captured as one span, not split by the
+// person pattern). The categories in the names are only describing what each
+// pattern tends to match — the output token is untyped.
 func NewMockExtractor() *MockExtractor {
 	return &MockExtractor{rules: []rule{
-		{domain.EntityDate, regexp.MustCompile(
+		{re: regexp.MustCompile(
 			`\b(?:January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{1,2}(?:st|nd|rd|th)?(?:,\s*\d{4})?\b`)},
-		{domain.EntityDate, regexp.MustCompile(`\b\d{1,2}/\d{1,2}/\d{2,4}\b`)},
-		{domain.EntityDate, regexp.MustCompile(`\b(?:19|20)\d{2}\b`)},
-		{domain.EntityGPE, regexp.MustCompile(
+		{re: regexp.MustCompile(`\b\d{1,2}/\d{1,2}/\d{2,4}\b`)},
+		{re: regexp.MustCompile(`\b(?:19|20)\d{2}\b`)},
+		{re: regexp.MustCompile(
 			`\b\d{1,5}\s+(?:[A-Z][a-zA-Z]+\.?\s+){1,3}(?:Street|St|Avenue|Ave|Road|Rd|Boulevard|Blvd|Lane|Ln|Drive|Dr|Way|Court|Ct|Place|Pl|Square|Sq)\b\.?`)},
-		{domain.EntityOrg, regexp.MustCompile(
+		{re: regexp.MustCompile(
 			`\b(?:[A-Z][A-Za-z&.\-]+\s+){0,4}(?:Inc|Incorporated|Corp|Corporation|Company|Co|Ltd|LLC|PLC|Group|Technologies|Systems|Solutions|Holdings|Industries|Bank|Partners|Capital|Ventures|University|Institute|Association|Foundation|Agency|Department|Ministry)\b\.?`)},
-		{domain.EntityPerson, regexp.MustCompile(
+		{nameLike: true, re: regexp.MustCompile(
 			`\b(?:(?:Mr|Mrs|Ms|Dr|Prof|President|CEO|CFO|CTO|Senator|Governor|Mayor|Chairman)\.?\s+)?[A-Z][a-z]+(?:\s+[A-Z]\.)?(?:\s+[A-Z][a-z]+){1,2}\b`)},
 	}}
 }
@@ -57,7 +63,6 @@ func (m *MockExtractor) Extract(_ context.Context, doc domain.Document) ([]domai
 func (m *MockExtractor) extractSentence(s sentence) []domain.Entity {
 	type span struct {
 		start, end int // byte offsets within the sentence
-		typ        domain.EntityType
 		text       string
 	}
 	var spans []span
@@ -78,24 +83,25 @@ func (m *MockExtractor) extractSentence(s sentence) []domain.Entity {
 			if text == "" {
 				continue
 			}
-			// Drop "PERSON" matches that are really titles or headline phrases
-			// (e.g. "Chief Executive Officer", "Announces New Leadership"). A real
-			// NLP model would not make these mistakes; the stub guards against the
-			// most common false positives so demo output stays clean.
-			if r.typ == domain.EntityPerson && (isAllRoleWords(text) || containsNonNameWord(text)) {
+			// Drop name-like matches that are really titles or headline phrases
+			// (e.g. "Chief Executive Officer", "Announces New Leadership") so they
+			// aren't emitted as candidate tokens. A real NLP model would avoid these;
+			// the stub guards against the most common false positives.
+			if r.nameLike && (isAllRoleWords(text) || containsNonNameWord(text)) {
 				continue
 			}
-			spans = append(spans, span{loc[0], loc[1], r.typ, text})
+			spans = append(spans, span{loc[0], loc[1], text})
 		}
 	}
 	sort.Slice(spans, func(i, j int) bool { return spans[i].start < spans[j].start })
 
+	context := strings.TrimSpace(s.text)
 	out := make([]domain.Entity, 0, len(spans))
 	for _, sp := range spans {
 		runeOff := s.runeStart + utf8.RuneCountInString(s.text[:sp.start])
 		out = append(out, domain.Entity{
-			Text: sp.text,
-			Type: sp.typ,
+			Text:    sp.text,
+			Context: context, // the entity's sentence, passed to classification
 			Position: domain.Position{
 				Page:       pageForOffset(s.docPrefix),
 				Sentence:   s.index,

@@ -38,23 +38,34 @@ func (w *ClassificationWorker) Run(ctx context.Context) error {
 	}.run(ctx)
 }
 
-// handle processes one classify job. It is idempotent: an already-classified
-// token is a no-op (so a redelivered message never double-counts progress), and
-// writes from a superseded run are dropped.
+// handle is the broker adapter: decode, run the service logic (Process), and map
+// domain errors to delivery decisions (drop vs retry).
 func (w *ClassificationWorker) handle(ctx context.Context, msg queue.Message) error {
 	job, err := decode[ClassifyJob](msg.Payload)
 	if err != nil {
 		w.log.Error("undecodable classify job; dropping", "err", err)
 		return nil
 	}
-
-	tok, err := w.store.GetToken(ctx, job.TokenID)
-	if errors.Is(err, domain.ErrNotFound) {
-		// The token was removed by a full rerun; the job is obsolete.
-		return nil
-	}
-	if err != nil {
+	err = w.Process(ctx, job)
+	switch {
+	case errors.Is(err, domain.ErrNotFound), errors.Is(err, domain.ErrStaleWrite):
+		return nil // token gone (full rerun) or superseded run: drop
+	case err != nil:
 		return err
+	}
+	return nil
+}
+
+// Process classifies one token and records the result, advancing the document's
+// progress. It owns the stage decisions (idempotent skip, stale-run fencing, and
+// completion when the last token is classified); the store only provides
+// primitives. Persisting the result and advancing the counter happen in one
+// transaction, so progress can never diverge from the classified rows.
+func (w *ClassificationWorker) Process(ctx context.Context, job ClassifyJob) error {
+	// Cheap pre-check before the (potentially slow) LLM call: skip work already done.
+	tok, err := w.store.GetToken(ctx, job.TokenID)
+	if err != nil {
+		return err // ErrNotFound (token removed by full rerun) bubbles to handle
 	}
 	if tok.Status == domain.TokenClassified {
 		return nil // idempotent: already classified
@@ -66,13 +77,47 @@ func (w *ClassificationWorker) handle(ctx context.Context, msg queue.Message) er
 		// pending so it is redelivered and retried later.
 		return err
 	}
+	return w.apply(ctx, job.TokenID, job.RunVersion, result)
+}
 
-	err = w.store.ApplyClassification(ctx, job.TokenID, job.RunVersion, result)
-	switch {
-	case errors.Is(err, domain.ErrStaleWrite), errors.Is(err, domain.ErrNotFound):
-		return nil // superseded by a newer run, or token gone: drop
-	case err != nil:
-		return err
-	}
-	return nil
+// apply persists the classification and advances progress in one transaction,
+// owning the completion decision. It re-checks under row locks so concurrent or
+// redelivered attempts are safe: an already-classified token is a no-op (no
+// double count), and writes from a superseded run are fenced.
+func (w *ClassificationWorker) apply(ctx context.Context, tokenID int64, runVersion int, result domain.Classification) error {
+	return w.store.WithinTx(ctx, func(ctx context.Context, tx *store.Tx) error {
+		tok, err := tx.GetTokenForUpdate(ctx, tokenID)
+		if err != nil {
+			return err
+		}
+		if tok.RunVersion != runVersion {
+			return domain.ErrStaleWrite
+		}
+		if tok.Status == domain.TokenClassified {
+			return nil // idempotent under lock: do not double-count
+		}
+
+		// Lock the document and fence a superseded run at the document level too.
+		doc, err := tx.GetDocumentForUpdate(ctx, tok.DocumentID)
+		if err != nil {
+			return err
+		}
+		if doc.RunVersion != runVersion {
+			return domain.ErrStaleWrite
+		}
+
+		if err := tx.SetTokenClassified(ctx, tokenID, result); err != nil {
+			return err
+		}
+		newCount, err := tx.IncrementClassifiedCount(ctx, tok.DocumentID)
+		if err != nil {
+			return err
+		}
+		if newCount >= doc.TotalTokens {
+			if err := tx.MarkDocumentCompleted(ctx, tok.DocumentID); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
 }
